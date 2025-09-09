@@ -42,7 +42,7 @@ class StatDataset(Dataset):
         # values: [S], feat_ids: [S], label: []
         return self.X[idx], self.feat_idx, self.y[idx]
 
-full_ds = StatDataset(X, y, standardize=True)
+full_ds = StatDataset(X, y, standardize=False)
 train_size = int(0.8 * len(full_ds))
 test_size  = len(full_ds) - train_size
 train_ds, test_ds = random_split(full_ds, [train_size, test_size],
@@ -72,7 +72,14 @@ class StatTransformer(nn.Module):
 
     def forward(self, values: torch.Tensor, feat_ids: torch.Tensor):
         # values: [B, S], feat_ids: [S]
-        B, S = values.size(0), values.size(1)
+        B, S = values.shape
+        
+        # (핵심) feat_ids가 [B, S]로 들어오면 첫 행만 사용해서 [S]로 축소
+        if feat_ids.dim() == 2:
+            feat_ids = feat_ids[0]
+        # dtype 보장
+        feat_ids = feat_ids.to(values.device).long()
+
         val_emb  = self.val_proj(values.unsqueeze(-1))             # [B, S, d]
         feat_emb = self.feat_embed(feat_ids.to(values.device))     # [S, d]
         feat_emb = feat_emb.unsqueeze(0).expand(B, S, -1)          # [B, S, d]
@@ -93,7 +100,6 @@ model = StatTransformer(num_stats=N_STATS, d_model=64, nhead=4, num_layers=2,
 
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-
 # 4) 학습 / 검증
 def run_epoch(loader, model, optimizer=None):
     is_train = optimizer is not None
@@ -112,7 +118,7 @@ def run_epoch(loader, model, optimizer=None):
         n     += vals.size(0)
     return total / max(n, 1)
 
-EPOCHS = 10
+EPOCHS = 100
 for epoch in range(1, EPOCHS + 1):
     train_loss = run_epoch(train_loader, model, optimizer)
     test_loss  = run_epoch(test_loader,  model, optimizer=None)
