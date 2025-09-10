@@ -20,7 +20,9 @@ X = rng.normal(0, 1, size=(N_SAMPLES, N_STATS)).astype(np.float32)
 
 w = np.zeros(N_STATS, dtype=np.float32)
 w[[0, 3, 7, 12, 21]] = [1.6, -1.2, 2.0, 0.9, -1.5]
-logit = X @ w + rng.normal(0, 0.5, size=N_SAMPLES)
+#logit = X @ w + rng.normal(0, 0.5, size=N_SAMPLES)
+logit = X @ w
+
 y = (1 / (1 + np.exp(-logit))).astype(np.float32)
 
 # 2) Dataset (values, feat_ids, label 모두 반환)
@@ -42,8 +44,11 @@ class StatDataset(Dataset):
     def __getitem__(self, idx):
         # values: [S], feat_ids: [S], label: []
         return self.X[idx], self.feat_idx, self.y[idx]
+    def get_stats(self):
+        """ (mean[1,S], std[1,S]) 를 torch.Tensor로 반환 (없으면 None) """
+        return self.X, self.feat_idx, self.y
 
-full_ds = StatDataset(X, y, standardize=False)
+full_ds = StatDataset(X, y, standardize=True)
 train_size = int(0.8 * len(full_ds))
 test_size  = len(full_ds) - train_size
 train_ds, test_ds = random_split(full_ds, [train_size, test_size],
@@ -176,12 +181,120 @@ def run_epoch(loader, model, optimizer=None):
         n     += vals.size(0)
     return total / max(n, 1)
 
-EPOCHS = 10
+EPOCHS = 300
 for epoch in range(1, EPOCHS + 1):
     train_loss = run_epoch(train_loader, model, optimizer)
     test_loss  = run_epoch(test_loader,  model, optimizer=None)
     print(f"[{epoch:02d}] train MSE: {train_loss:.4f} | test MSE: {test_loss:.4f}")
 
+
+def compute_ig_for_inputs(model, inputs, device, steps=64, baseline_mode="zero"):
+    """
+    inputs: torch.Tensor 또는 numpy.ndarray, shape [N, S]
+            (학습 때와 동일한 전처리 상태여야 함)
+    return: attributions [N, S] (torch.Tensor, CPU로 반환)
+    """
+    model.eval()
+
+    # to tensor
+    if isinstance(inputs, np.ndarray):
+        vals = torch.from_numpy(inputs.astype(np.float32))
+    else:
+        vals = inputs.clone().detach().float()
+    vals = vals.to(device)  # [N, S]
+
+    # feat_ids: [S] 자동 생성 (0..S-1)
+    S = vals.size(1)
+    feat_ids = torch.arange(S, dtype=torch.long, device=device)
+
+    # baseline 만들기
+    if baseline_mode == "zero" or baseline_mode is None:
+        baseline = torch.zeros_like(vals)
+    elif baseline_mode == "mean":
+        baseline = vals.mean(dim=0, keepdim=True).expand_as(vals)
+    else:
+        raise ValueError("baseline_mode must be one of: None, 'zero', 'mean'")
+
+    # IG 본체
+    alphas = torch.linspace(0.0, 1.0, steps, device=device).view(-1, 1, 1)  # [steps,1,1]
+    path_points = baseline.unsqueeze(0) + alphas * (vals - baseline).unsqueeze(0)  # [steps,N,S]
+
+    total_grads = torch.zeros_like(vals)
+    for i in range(steps):
+        x = path_points[i].clone().detach().requires_grad_(True)  # [N,S]
+        preds,_ = model(x, feat_ids)                                # [N]
+        preds_sum = preds.sum()
+        grads = torch.autograd.grad(preds_sum, x, retain_graph=False)[0]  # [N,S]
+        total_grads += grads
+
+    avg_grads = total_grads / steps
+    atts = (vals - baseline) * avg_grads                         # [N,S]
+    return atts.detach().cpu()
+
+SEED = 1
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+# 1) 데이터 생성
+N_SAMPLES = 10
+
+rng = np.random.default_rng(SEED)
+X = rng.normal(0, 1, size=(N_SAMPLES, N_STATS)).astype(np.float32)
+
+#logit = X @ w + rng.normal(0, 0.5, size=N_SAMPLES)
+logit = X @ w
+y = (1 / (1 + np.exp(-logit))).astype(np.float32)
+
+inference_set = StatDataset(X, y, standardize=True)
+inference_data, feat_ids, inference_util = inference_set.get_stats()
+
+preds = None
+attn_maps = None
+with torch.no_grad():
+    preds, attn_maps = model(inference_data, feat_ids, return_attn=True)
+
+atts = compute_ig_for_inputs(
+    model,
+    inputs=inference_data,         # [10, S]
+    device=device,
+    steps=256,
+    baseline_mode="zero"    # or "mean"
+)                           # -> [10, S]
+
+print("IG shape:", atts.shape)  # torch.Size([10, S])
+
+def print_per_sample_topk(atts, topk=5, stat_names=None, preds=None, util=None):
+    """
+    atts: [N, S] torch.Tensor (compute_ig_for_inputs 결과)
+    """
+    A = atts.numpy()
+    N, S = A.shape
+    if stat_names is None:
+        stat_names = [f"stat_{i+1}" for i in range(S)]
+
+    for i in range(N):
+        contrib = A[i]  # [S]
+        pos_order = np.argsort(-contrib)  # 큰 양수부터
+        neg_order = np.argsort(contrib)   # 큰 음수부터
+
+        print(f"\n=== Sample {i} ===")
+        if preds != None:
+            print(f" pred={preds[i].item():.3f} | true={util[i].item():.3f}")
+        print(f"[+IG Top-{topk}] (increase)")
+        for r, j in enumerate(pos_order[:topk], 1):
+            print(f" {r:2d}. {stat_names[j]} (idx={j}) IG={contrib[j]:.6f}")
+
+        print(f"[-IG Top-{topk}] (decrease)")
+        for r, j in enumerate(neg_order[:topk], 1):
+            print(f" {r:2d}. {stat_names[j]} (idx={j}) IG={contrib[j]:.6f}")
+
+# 호출
+print_per_sample_topk(atts, topk=5, stat_names=[f"stat_{i+1}" for i in range(N_STATS)], preds=preds, util=y)
+
+
+
+
+'''
 def _normalize_feat_ids(feat_ids, device):
     # [S] 또는 [B,S]로 올 수 있으니 [S]로 정규화
     if feat_ids.dim() == 2:
@@ -215,9 +328,6 @@ def integrated_gradients(model, vals, feat_ids, device, baseline=None, steps=64)
         baseline = _make_baseline(vals, mode="zero").to(device)
     else:
         baseline = baseline.to(device)
-    
-    print(baseline)
-    print(baseline.shape)
 
     # alphas: 0..1
     alphas = torch.linspace(0.0, 1.0, steps, device=device).view(-1, 1, 1)  # [steps,1,1]
@@ -301,7 +411,7 @@ neg_idx, neg_scores, _ = ig_rank_signed(atts, stat_names, topk=30, mode="neg")
 
 print("\n=== 방향 무시 (절댓값) Top-K ===")
 abs_idx, abs_scores, _ = ig_rank_signed(atts, stat_names, topk=10, mode="abs")
-
+'''
 
 '''
 layer_idx = 0       # 0 ~ num_layers-1
