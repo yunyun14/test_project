@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import random_split
 
 # ---------------------
 # 0) Repro & device
@@ -24,8 +25,8 @@ device = torch.device("cpu")  # 필요하면 "cuda"로 바꾸세요
 # ---------------------
 # 1) Problem sizes
 # ---------------------
-T   = 2    # time steps per sequence
-M   = 2    # masters
+T   = 16    # time steps per sequence
+M   = 8    # masters
 SG  = 4    # global stat dim
 SM  = 4    # master stat dim (0th = remaining BW)
 CG  = 4    # global cfg dim
@@ -44,13 +45,14 @@ TOKENS_PER_T = 3 + 3*M  # [SG, CG, CGD, SM×M, CM×M, CMD×M]
 # 2) Synthetic label generator (hidden dynamics)
 # ---------------------
 # 학습용 정답(y)을 만들기 위한 은닉 선형계/동역학 (랜덤 고정)
-W_util_sg  = torch.zeros(SG, 1)
-W_util_cg  = torch.randn(CG, 1) * 0.4
-W_util_cgd = torch.randn(CGD,1) * 0.2
+important_idx = torch.tensor([0, 1, 2, 3])
+important_w   = torch.tensor([2.0, -1.0, 2.0, -1.0])
 
-W_lat_sm   = torch.randn(SM, 1) * 0.7
-W_lat_cm   = torch.randn(CM, 1) * 0.5
-W_lat_cgd  = torch.randn(CGD,1) * 0.2
+W_util_sg  = torch.zeros(SG, 1)
+W_util_sg[important_idx, 0] = important_w
+
+W_lat_sm   = torch.zeros(SM, 1)
+W_lat_sm[important_idx, 0] = important_w
 
 A_sg    = torch.randn(SG, SG) * 0.05
 A_sm    = torch.randn(SM, SM) * 0.05
@@ -65,24 +67,20 @@ def synth_labels(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd):
     Return:
       y_util[T,1], y_lat[T,M,1], y_next_sg[T,SG], y_next_sm[T,M,SM]
     """
-    Tn = X_sg.shape[0]; Mn = X_sm.shape[1]
+    Tn = X_sg.shape[0]
+    Mn = X_sm.shape[1]
     y_util = torch.zeros(Tn, 1)
     y_lat  = torch.zeros(Tn, Mn, 1)
     y_next_sg = torch.zeros(Tn, SG)
     y_next_sm = torch.zeros(Tn, Mn, SM)
     with torch.no_grad():
         for t in range(Tn):
-            y_util[t] = torch.sigmoid(X_sg[t] @ W_util_sg + X_cg[t] @ W_util_cg + X_cgd[t] @ W_util_cgd)
-            lat_m = (X_sm[t] @ W_lat_sm + X_cm[t] @ W_lat_cm + (X_cgd[t] @ W_lat_cgd).view(1,1)).squeeze(-1)
-            y_lat[t] = F.softplus(lat_m).unsqueeze(-1)
+            y_util[t] = torch.sigmoid(X_sg[t] @ W_util_sg )
+            y_lat[t] = torch.abs((X_sm[t] @ W_lat_sm) * 1000)
             if t < Tn-1:
-                y_next_sg[t] = X_sg[t] + X_sg[t] @ A_sg + X_cg[t] @ B_g_cg + X_cgd[t] @ B_g_cgd
-                ns = X_sm[t] + X_sm[t] @ A_sm + X_cm[t] @ B_m_cm + X_cmd[t] @ B_m_cmd
+                y_next_sg[t] = X_sg[t + 1]
+                y_next_sm[t] = X_sm[t + 1]
                 # 간단 소비 모델: 남은 BW 감소 (0..1로 클램프)
-                served = torch.sigmoid((X_sm[t] @ W_lat_sm).squeeze(-1)) * 0.15
-                R_next = torch.clamp(X_sm[t,:,REMAIN_IDX] - served, 0.0, 1.0)
-                ns[:, REMAIN_IDX] = R_next
-                y_next_sm[t] = ns
             else:
                 y_next_sg[t] = X_sg[t]
                 y_next_sm[t] = X_sm[t]
@@ -110,12 +108,6 @@ class SocDataset(Dataset):
                 X_cmd = torch.zeros(T, M, CMD)
             y_util, y_lat, y_next_sg, y_next_sm = synth_labels(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
             self.data.append((X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd, y_util, y_lat, y_next_sg, y_next_sm))
-            print("X_sg:", X_sg)
-            print("X_sm:", X_sm)
-            print("X_cg:", X_cg)
-            print("X_cm:", X_cm)
-            print("y_util:", y_util)
-            assert(0)
     def __len__(self): return self.N
     def __getitem__(self, i): return self.data[i]
 
@@ -280,8 +272,13 @@ class OneEncoder(nn.Module):
 # ---------------------
 model = OneEncoder(T, M, D, SG, SM, CG, CGD, CM, CMD, layers=LAYERS, heads=HEADS).to(device)
 
-train_ds = SocDataset(N=1, rollout_deltas=False)  # Δ=0 (분석 스타일)로 학습
-val_ds   = SocDataset(N=1,  rollout_deltas=False)
+print("Make dataset")
+full_ds = SocDataset(N=300, rollout_deltas=False)
+n_total = len(full_ds)         # 1000
+n_train = int(n_total * 0.8)   # 80%
+n_val   = n_total - n_train
+
+train_ds, val_ds = random_split(full_ds, [n_train, n_val])
 
 # collate: 각 batch는 "샘플 튜플들의 리스트"로 그대로 전달
 train_loader = DataLoader(train_ds, batch_size=8, shuffle=True,  collate_fn=lambda b: b)
@@ -301,25 +298,21 @@ class MAPELoss(nn.Module):
         return torch.mean(torch.abs((targets - preds) / (targets.abs() + self.eps)))
 criterion = MAPELoss()
 
-EPOCHS = 100
+EPOCHS = 1000
 for ep in range(EPOCHS):
     model.train(); total=0; steps=0
     for batch in train_loader:
         loss = 0.0
         for (X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd, y_util, y_lat, y_next_sg, y_next_sm) in batch:
             util, lat, nsg, nsm = model.analysis(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
-            #l_util = F.mse_loss(util, y_util)
-            #l_lat  = F.mse_loss(lat,  y_lat)
-            #l_nsg  = F.mse_loss(nsg[:-1], y_next_sg[:-1])  # 마지막 t는 제외
-            #l_nsm  = F.mse_loss(nsm[:-1], y_next_sm[:-1])
             l_util = criterion(util, y_util)
             l_lat  = criterion(lat,  y_lat)
             l_nsg  = criterion(nsg[:-1], y_next_sg[:-1])  # 마지막 t는 제외
             l_nsm  = criterion(nsm[:-1], y_next_sm[:-1])
             # soft physics: remaining ∈ [0,1]
             R_pred = torch.clamp(nsm[:,:,REMAIN_IDX], 0.0, 1.0)
-            l_phys = criterion(R_pred, nsm[:,:,REMAIN_IDX])
-            loss = loss + (l_util + l_lat + l_nsg + l_nsm + l_phys)
+            #l_phys = criterion(R_pred, nsm[:,:,REMAIN_IDX])
+            loss = loss + (l_util + l_lat + l_nsg + l_nsm)
         loss = loss / len(batch)
         opt.zero_grad(); loss.backward(); opt.step()
         total += loss.item(); steps += 1
@@ -336,10 +329,10 @@ for ep in range(EPOCHS):
                 l_nsg  = criterion(nsg[:-1], y_next_sg[:-1])
                 l_nsm  = criterion(nsm[:-1], y_next_sm[:-1])
                 R_pred = torch.clamp(nsm[:,:,REMAIN_IDX], 0.0, 1.0)
-                l_phys = criterion(R_pred, nsm[:,:,REMAIN_IDX])
-                loss = loss + (l_util + l_lat + 0.7*l_nsg + 0.7*l_nsm + 0.1*l_phys)
+                #l_phys = criterion(R_pred, nsm[:,:,REMAIN_IDX])
+                loss = loss + (l_util + l_lat + l_nsg + l_nsm)
             vtotal += loss.item()/len(batch); vsteps += 1
-    print(f"Epoch {ep+1}/{EPOCHS} | train {total/steps:.4f} | val {vtotal/vsteps:.4f}")
+    print(f"Epoch {ep+1}/{EPOCHS} | train {total/steps:.4f} (util: ) | val {vtotal/vsteps:.4f}")
 
 # ---------------------
 # 7) Quick evaluation: analysis vs rollout on a fresh sample
