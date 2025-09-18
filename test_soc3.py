@@ -7,6 +7,7 @@
 # - Mini-batch training
 # - Inference: B=1 또는 B>1 모두 동일 경로
 # - IG & Attention 결과를 Plotly HTML로 저장 (인터랙티브)
+# - TensorBoard 로 학습 로그 기록
 # =========================
 
 import numpy as np
@@ -22,6 +23,11 @@ import plotly.io as pio
 from plotly.subplots import make_subplots
 from typing import Union, Callable, Optional
 import os
+from datetime import datetime
+
+# ===== TensorBoard =====
+from torch.utils.tensorboard import SummaryWriter
+
 # ---------------------
 # 0) Repro & device
 # ---------------------
@@ -167,39 +173,28 @@ class StockEquivalentEncoderLayerWithAttn(nn.Module):
         else:
             self.activation = activation
 
-        # stock 기본과 동일: 별도 재초기화 불필요(서브모듈의 기본 init 사용)
-        # (MultiheadAttention: xavier_uniform_ / Linear: kaiming_uniform_ / LN: weight=1, bias=0)
-
-        self.norm_first = norm_first  # 필요 시 Pre-LN로 바꿀 수 있음 (stock 옵션과 동일)
+        self.norm_first = norm_first
 
     def forward(self, src, attn_mask=None, key_padding_mask=None, need_weights=True):
-        """
-        src: [B, L, D]
-        attn_mask: [L, L] 또는 [B * num_heads, L, L] 등 stock과 동일 규격
-        key_padding_mask: [B, L] (True=ignore)
-        need_weights: True면 layer의 attn map 반환 (shape: [B, H, L, L])
-        """
         if self.norm_first:
-            # Pre-LN 경로 (stock norm_first=True와 동일)
             x = self.norm1(src)
             attn_out, attn_w = self.self_attn(
                 x, x, x,
                 attn_mask=attn_mask,
                 key_padding_mask=key_padding_mask,
-                need_weights=True,                 # 항상 뽑아두고 need_weights로 반환 제어
-                average_attn_weights=False         # [B,H,L,L]
+                need_weights=True,
+                average_attn_weights=False
             )
             src = src + self.dropout1(attn_out)
             x = self.norm2(src)
             y = self.linear2(self.dropout(self.activation(self.linear1(x))))
             src = src + self.dropout2(y)
         else:
-            # Post-LN 경로 (stock 기본)
             attn_out, attn_w = self.self_attn(
                 src, src, src,
                 attn_mask=attn_mask,
                 key_padding_mask=key_padding_mask,
-                need_weights=True,                 # 항상 뽑아두고 need_weights로 반환 제어
+                need_weights=True,
                 average_attn_weights=False
             )
             src = src + self.dropout1(attn_out)
@@ -216,31 +211,15 @@ class StockEquivalentEncoderLayerWithAttn(nn.Module):
 
     @torch.no_grad()
     def load_from_stock(self, stock_layer: nn.TransformerEncoderLayer):
-        """
-        stock(nn.TransformerEncoderLayer)에서 가중치를 그대로 복사하여
-        완전히 같은 출력을 내도록 함.
-        """
-        # MHA
         self.self_attn.load_state_dict(stock_layer.self_attn.state_dict())
-        # FFN
         self.linear1.load_state_dict(stock_layer.linear1.state_dict())
         self.linear2.load_state_dict(stock_layer.linear2.state_dict())
-        # Norms
         self.norm1.load_state_dict(stock_layer.norm1.state_dict())
         self.norm2.load_state_dict(stock_layer.norm2.state_dict())
-        # Dropout 확률 등은 생성자에서 동일하게 만들었으므로 OK
-        # 활성함수/순서/옵션도 동일해야 함
         return self
 
 
-# -------------------------------
-# Stock-equivalent Encoder(+maps)
-# -------------------------------
 class StockEquivalentTransformerEncoder(nn.Module):
-    """
-    stock `nn.TransformerEncoder`와 동일한 레이어 스택, forward 순서.
-    차이: 각 레이어의 attention map을 리스트로 모아 반환 가능.
-    """
     def __init__(
         self,
         d_model: int,
@@ -269,25 +248,15 @@ class StockEquivalentTransformerEncoder(nn.Module):
         ])
 
     def forward(self, x, attn_mask=None, key_padding_mask=None, need_attn_maps: bool = True):
-        """
-        x: [B,L,D]
-        return:
-          H: [B,L,D]
-          attn_maps: Optional[list of [B,H,L,L]]
-        """
         attn_maps = [] if need_attn_maps else None
         for layer in self.layers:
             x, attn_w = layer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_attn_maps)
             if need_attn_maps:
-                attn_maps.append(attn_w)  # 각 레이어의 [B,H,L,L]
+                attn_maps.append(attn_w)
         return x, attn_maps
 
     @torch.no_grad()
     def load_from_stock(self, stock_encoder: nn.TransformerEncoder):
-        """
-        stock(nn.TransformerEncoder)에서 가중치 복사.
-        주의: stock과 같은 num_layers/구성이어야 함.
-        """
         stock_layers = list(stock_encoder.layers)
         assert len(stock_layers) == len(self.layers), "layer 수가 동일해야 복사 가능"
         for my, st in zip(self.layers, stock_layers):
@@ -301,12 +270,6 @@ class MLP(nn.Module):
     def forward(self,x): return self.net(x)
 
 class OneEncoder(nn.Module):
-    """
-    - 단일 TransformerEncoder
-    - 시점 t 토큰 순서: [SG, CG, CGD, SM×M, CM×M, CMD×M]  -> 3+3M개
-    - 분석/학습: analysis_batch (모든 시점 + block-causal mask)
-    - 롤아웃: rollout_batch (0..k만 실제, k+1..T-1은 PAD + 부분 마스크)
-    """
     def __init__(self, T, M, D, SG, SM, CG, CGD, CM, CMD, layers=1, heads=4):
         super().__init__()
         self.T, self.M, self.D = T, M, D
@@ -319,13 +282,11 @@ class OneEncoder(nn.Module):
         self.f_cm  = MLP(CM,  D)
         self.f_cmd = MLP(CMD, D)
         # embeddings
-        self.type_emb   = nn.Embedding(7, D)   # 0..5 types, 6=PAD(미사용)
+        self.type_emb   = nn.Embedding(7, D)
         self.master_emb = nn.Embedding(M, D)
         self.time_emb   = nn.Embedding(T, D)
         
-        # ======================================================
-        # 1) stock 인코더를 "초기화 용도"로 한 번 만든다
-        # ======================================================
+        # stock 초기화 후 custom으로 복사
         stock_layer = nn.TransformerEncoderLayer(
             d_model=D, nhead=heads, dim_feedforward=4*D,
             dropout=0.1, batch_first=True, activation="gelu",
@@ -333,16 +294,11 @@ class OneEncoder(nn.Module):
         )
         stock_encoder = nn.TransformerEncoder(stock_layer, num_layers=layers)
         
-        # ======================================================
-        # 2) custom 인코더를 같은 하이퍼파라미터로 만들고
-        #    stock에서 가중치를 그대로 복사한다 (bit-exact)
-        # ======================================================
         self.encoder = StockEquivalentTransformerEncoder(
             d_model=D, nhead=heads, dim_feedforward=4*D,
             num_layers=layers, dropout=0.1,
             activation="gelu", batch_first=True, norm_first=False
         )
-        # stock -> custom 가중치 복사
         self.encoder.load_from_stock(stock_encoder)
 
         # heads
@@ -359,59 +315,51 @@ class OneEncoder(nn.Module):
                 mask[t*self.S_PER_T:(t+1)*self.S_PER_T, k*self.S_PER_T:(k+1)*self.S_PER_T] = 0.0
         return mask
 
-    # ----- (batch) pack
     def _pack_batch(self, X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd):
-        # X_* shapes:
-        #   X_sg:  [B,T,SG],   X_sm:  [B,T,M,SM],  X_cg:  [B,T,CG]
-        #   X_cgd: [B,T,CGD],  X_cm:  [B,T,M,CM],  X_cmd:[B,T,M,CMD]
         B, Tn, M, D = X_sg.size(0), self.T, self.M, self.D
         tokens = []
         dev = self.time_emb.weight.device
 
-        # 타입 임베딩: 1D/2D 두 가지 버전
-        type_sg_1d  = self.type_emb.weight[0].view(1, D)     # for [B,D]
+        type_sg_1d  = self.type_emb.weight[0].view(1, D)
         type_cg_1d  = self.type_emb.weight[1].view(1, D)
         type_cgd_1d = self.type_emb.weight[2].view(1, D)
 
-        type_sm_2d  = self.type_emb.weight[3].view(1, 1, D)  # for [B,M,D]
+        type_sm_2d  = self.type_emb.weight[3].view(1, 1, D)
         type_cm_2d  = self.type_emb.weight[4].view(1, 1, D)
         type_cmd_2d = self.type_emb.weight[5].view(1, 1, D)
 
         ids = torch.arange(M, device=dev)
-        idv = self.master_emb(ids).view(1, M, D)  # [1,M,D]
+        idv = self.master_emb(ids).view(1, M, D)
 
         for t in range(Tn):
-            pos_1d = self.time_emb.weight[t].view(1, D)      # for [B,D]
-            pos_2d = pos_1d.view(1, 1, D)                    # for [B,M,D]
+            pos_1d = self.time_emb.weight[t].view(1, D)
+            pos_2d = pos_1d.view(1, 1, D)
 
-            # ---- 전역 토큰: [B,D] + [1,D]
-            z_sg  = self.f_sg(X_sg[:, t])   + type_sg_1d  + pos_1d   # [B,D]
-            z_cg  = self.f_cg(X_cg[:, t])   + type_cg_1d  + pos_1d   # [B,D]
-            z_cgd = self.f_cgd(X_cgd[:, t]) + type_cgd_1d + pos_1d   # [B,D]
+            z_sg  = self.f_sg(X_sg[:, t])   + type_sg_1d  + pos_1d
+            z_cg  = self.f_cg(X_cg[:, t])   + type_cg_1d  + pos_1d
+            z_cgd = self.f_cgd(X_cgd[:, t]) + type_cgd_1d + pos_1d
 
-            # ---- 마스터 토큰: [B,M,D] + [1,1,D] + [1,M,D]
             z_sm  = self.f_sm(X_sm[:, t]).view(B,M,D)   + type_sm_2d  + pos_2d + idv
             z_cm  = self.f_cm(X_cm[:, t]).view(B,M,D)   + type_cm_2d  + pos_2d + idv
             z_cmd = self.f_cmd(X_cmd[:, t]).view(B,M,D) + type_cmd_2d + pos_2d + idv
 
             step = torch.cat([
-                z_sg.unsqueeze(1),   # [B,1,D]
-                z_cg.unsqueeze(1),   # [B,1,D]
-                z_cgd.unsqueeze(1),  # [B,1,D]
-                z_sm,                # [B,M,D]
-                z_cm,                # [B,M,D]
-                z_cmd                # [B,M,D]
-            ], dim=1)  # [B, S_PER_T, D]
+                z_sg.unsqueeze(1),
+                z_cg.unsqueeze(1),
+                z_cgd.unsqueeze(1),
+                z_sm,
+                z_cm,
+                z_cmd
+            ], dim=1)
 
             tokens.append(step)
        
         return torch.cat(tokens, dim=1)  # [B, T*S_PER_T, D]
 
-    # ---- 분석(배치)
     def analysis_batch(self, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB):
-        Xtok = self._pack_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)  # [B,L,D]
-        mask = self._build_block_causal_mask(Xtok.device)                    # [L,L]
-        H, attn_maps = self.encoder(Xtok, attn_mask=mask)                    # H:[B,L,D], attn_maps: list[LAYER][B,H,L,L]
+        Xtok = self._pack_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
+        mask = self._build_block_causal_mask(Xtok.device)
+        H, attn_maps = self.encoder(Xtok, attn_mask=mask)
 
         B = X_sgB.size(0)
         H = H.view(B, self.T, self.S_PER_T, self.D)
@@ -424,20 +372,12 @@ class OneEncoder(nn.Module):
         lat  = self.head_latency(h_sm)         # [B,T,M,1]
         nsg  = self.head_next_sg(h_cgd)        # [B,T,SG]
         nsm  = self.head_next_sm(h_cmd)        # [B,T,M,SM]
-        return util, lat, nsg, nsm, attn_maps  # attn_maps: list of [B,H,L,L]
+        return util, lat, nsg, nsm, attn_maps
 
-    # ---- 롤아웃(배치)
     def rollout_batch(self, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB):
-        """
-        Returns:
-        utils : [B,T]
-        lats  : [B,T,M]
-        R_hist: [B,T,M]
-        """
         B, Tn, M, D = X_sgB.size(0), self.T, self.M, self.D
         dev = self.time_emb.weight.device
 
-        # clone (덮어쓰기 방지)
         X_sg = X_sgB.clone()
         X_sm = X_smB.clone()
         X_cg = X_cgB.clone()
@@ -445,13 +385,11 @@ class OneEncoder(nn.Module):
         X_cm = X_cmB.clone()
         X_cmd= X_cmdB.clone()
 
-        # 초기 남은 BW (배치)
-        R = X_sm[:, 0, :, REMAIN_IDX].clone()          # [B,M]
+        R = X_sm[:, 0, :, REMAIN_IDX].clone()
         R_hist = []
         utils = []
         lats  = []
 
-        # 미리 타입/마스터 임베딩 준비
         type_sg_1d  = self.type_emb.weight[0].view(1, D)
         type_cg_1d  = self.type_emb.weight[1].view(1, D)
         type_cgd_1d = self.type_emb.weight[2].view(1, D)
@@ -461,69 +399,63 @@ class OneEncoder(nn.Module):
         type_cmd_2d = self.type_emb.weight[5].view(1, 1, D)
 
         ids = torch.arange(M, device=dev)
-        idv = self.master_emb(ids).view(1, M, D)   # [1,M,D]
+        idv = self.master_emb(ids).view(1, M, D)
 
         for k in range(Tn):
-            # 현재 step k의 remaining BW 주입
-            X_sm[:, k, :, REMAIN_IDX] = R          # [B,M]
+            X_sm[:, k, :, REMAIN_IDX] = R
 
-            # ----- prefix (0..k) 토큰만 빌드 -----
             blocks = []
             for t in range(k+1):
                 pos_1d = self.time_emb.weight[t].view(1, D)
                 pos_2d = pos_1d.view(1, 1, D)
-                z_sg  = self.f_sg(X_sg[:,t])   + type_sg_1d  + pos_1d     # [B,D]
-                z_cg  = self.f_cg(X_cg[:,t])   + type_cg_1d  + pos_1d     # [B,D]
-                z_cgd = self.f_cgd(X_cgd[:,t]) + type_cgd_1d + pos_1d     # [B,D]
+                z_sg  = self.f_sg(X_sg[:,t])   + type_sg_1d  + pos_1d
+                z_cg  = self.f_cg(X_cg[:,t])   + type_cg_1d  + pos_1d
+                z_cgd = self.f_cgd(X_cgd[:,t]) + type_cgd_1d + pos_1d
                 z_sm  = self.f_sm(X_sm[:,t]).view(B,M,D)   + type_sm_2d + pos_2d + idv
                 z_cm  = self.f_cm(X_cm[:,t]).view(B,M,D)   + type_cm_2d + pos_2d + idv
                 z_cmd = self.f_cmd(X_cmd[:,t]).view(B,M,D) + type_cmd_2d + pos_2d + idv
                 step = torch.cat([z_sg.unsqueeze(1), z_cg.unsqueeze(1), z_cgd.unsqueeze(1),
-                              z_sm, z_cm, z_cmd], dim=1)        # [B,S_PER_T,D]
+                              z_sm, z_cm, z_cmd], dim=1)
                 blocks.append(step)
 
-            # prefix 시퀀스
-            Xtok = torch.cat(blocks, dim=1)  # [B, (k+1)*S_PER_T, D]
+            Xtok = torch.cat(blocks, dim=1)
             Lk = (k+1) * self.S_PER_T
 
-            # ----- prefix용 block-causal mask (slice) -----
             mask = torch.full((Lk, Lk), float('-inf'), device=dev)
             for t in range(k+1):
                 for kk in range(t+1):
                     mask[t*self.S_PER_T:(t+1)*self.S_PER_T, kk*self.S_PER_T:(kk+1)*self.S_PER_T] = 0.0
             
-            H, _ = self.encoder(Xtok, attn_mask=mask)  # [B,Lk,D]
+            H, _ = self.encoder(Xtok, attn_mask=mask)
 
-            # k 시점 출력 읽기 (prefix 기준 index)
             base = k * self.S_PER_T
             idx_sg  = base + 0
             idx_cgd = base + 2
             idx_sm0 = base + 3
             idx_cmd0= base + 3 + 2*M
 
-            h_sg  = H[:, idx_sg, :]                 # [B,D]
-            h_sm  = H[:, idx_sm0:idx_sm0+M, :]      # [B,M,D]
-            h_cgd = H[:, idx_cgd, :]                # [B,D]
-            h_cmd = H[:, idx_cmd0:idx_cmd0+M, :]    # [B,M,D]
+            h_sg  = H[:, idx_sg, :]
+            h_sm  = H[:, idx_sm0:idx_sm0+M, :]
+            h_cgd = H[:, idx_cgd, :]
+            h_cmd = H[:, idx_cmd0:idx_cmd0+M, :]
 
-            util_k = self.head_util(h_sg).squeeze(-1)   # [B]
-            lat_k  = self.head_latency(h_sm).squeeze(-1)# [B,M]
+            util_k = self.head_util(h_sg).squeeze(-1)
+            lat_k  = self.head_latency(h_sm).squeeze(-1)
 
             utils.append(util_k)
             lats.append(lat_k)
-            R_hist.append(X_sm[:, k, :, REMAIN_IDX].clone())  # [B,M]
+            R_hist.append(X_sm[:, k, :, REMAIN_IDX].clone())
 
-            # next state → k+1 입력 갱신 (배치)
             if k < Tn - 1:
-                X_sg[:, k+1] = self.head_next_sg(h_cgd)                 # [B,SG]
-                next_sm = self.head_next_sm(h_cmd)                       # [B,M,SM]
+                X_sg[:, k+1] = self.head_next_sg(h_cgd)
+                next_sm = self.head_next_sm(h_cmd)
                 next_sm[:,:,REMAIN_IDX] = torch.clamp(next_sm[:,:,REMAIN_IDX], 0.0, 1.0)
                 X_sm[:, k+1] = next_sm
-                R = next_sm[:,:,REMAIN_IDX]                              # [B,M]
+                R = next_sm[:,:,REMAIN_IDX]
 
-        utils = torch.stack(utils, dim=1)        # [B,T]
-        lats  = torch.stack(lats,  dim=1)        # [B,T,M]
-        R_hist= torch.stack(R_hist, dim=1)       # [B,T,M]
+        utils = torch.stack(utils, dim=1)
+        lats  = torch.stack(lats,  dim=1)
+        R_hist= torch.stack(R_hist, dim=1)
         return utils, lats, R_hist
 
 # ---------------------
@@ -547,6 +479,12 @@ val_loader   = DataLoader(val_ds,   batch_size=8, shuffle=False, collate_fn=coll
 
 opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
 
+# ===== TensorBoard: writer 생성 =====
+run_name = f"soc_T{T}_M{M}_D{D}_L{LAYERS}_H{HEADS}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+LOG_DIR = os.path.join("runs", run_name)
+writer = SummaryWriter(LOG_DIR)
+print(f"[TensorBoard] logging to: {LOG_DIR}")
+
 # ---------------------
 # 6) Training loop (teacher forcing on analysis; batched)
 # ---------------------
@@ -562,7 +500,7 @@ criterion = MAPELoss()
 def to_device_batch(batch, device, non_blocking=True):
     return [x.to(device, non_blocking=non_blocking) for x in batch]
 
-EPOCHS = 300  # 데모
+EPOCHS = 10  # 데모
 
 # === Checkpoint settings ===
 CKPT_DIR = "./checkpoints"
@@ -590,14 +528,20 @@ def load_checkpoint(path, model, optimizer=None, map_location=None):
     print(f"[checkpoint] loaded <- {path} (epoch={payload.get('epoch', 'NA')})")
     return payload
 
+last_train = None
+last_val   = None
+best_val = float("inf")
+best_epoch = -1
+
 if (not FORCE_TRAIN) and os.path.exists(CKPT_PATH):
-    # 체크포인트가 있으면 학습 건너뛰고 로드
     load_checkpoint(CKPT_PATH, model, optimizer=None, map_location=device)
     model.to(device).eval()
     print("[info] checkpoint found. skip training.")
+    # TensorBoard에 정보 남기기
+    writer.add_text("info", f"Loaded checkpoint {CKPT_PATH}, training skipped.")
 else:
     print("[info] training start...")
-    best_val = float("inf")
+    global_step = 0
     for ep in range(EPOCHS):
         model.train()
         total=0
@@ -612,11 +556,14 @@ else:
 
             l_util = criterion(util, y_utilB)
             l_lat  = criterion(lat,  y_latB)
-            l_nsg  = criterion(nsg[:,:-1], y_nsgB[:,:-1])  # 마지막 t 제외
+            l_nsg  = criterion(nsg[:,:-1], y_nsgB[:,:-1])
             l_nsm  = criterion(nsm[:,:-1], y_nsmB[:,:-1])
 
             loss = l_util + l_lat + l_nsg + l_nsm
             opt.zero_grad(); loss.backward(); opt.step()
+
+            # ===== TensorBoard: per-batch =====
+            writer.add_scalar("loss/train_step", loss.item(), global_step)
 
             total += loss.item()
             steps += 1
@@ -624,6 +571,7 @@ else:
             total_lat += l_lat.item()
             total_nsg += l_nsg.item()
             total_nsm += l_nsm.item()
+            global_step += 1
 
         # validation
         model.eval(); vtotal=0; vsteps=0
@@ -641,13 +589,43 @@ else:
         
         tr = total/steps
         va = vtotal/vsteps
+        last_train, last_val = tr, va
+
         print(f"Epoch {ep+1}/{EPOCHS} | train {total/steps:.4f} util {total_util/steps:.4f} lat {total_lat/steps:.4f} SG {total_nsg/steps:.4f} SM {total_nsm/steps:.4f} | val {vtotal/vsteps:.4f}")
-        # 가장 좋은 val일 때만 저장(원하면 매 epoch 저장으로 바꿔도 됨)
+
+        # ===== TensorBoard: per-epoch =====
+        writer.add_scalar("loss/train", tr, ep+1)
+        writer.add_scalar("loss/val", va, ep+1)
+        writer.add_scalar("loss/util", total_util/steps, ep+1)
+        writer.add_scalar("loss/lat",  total_lat/steps,  ep+1)
+        writer.add_scalar("loss/sg",   total_nsg/steps,  ep+1)
+        writer.add_scalar("loss/sm",   total_nsm/steps,  ep+1)
+        # learning rate (첫 param group 기준)
+        writer.add_scalar("lr", opt.param_groups[0]["lr"], ep+1)
+
         if va < best_val:
             best_val = va
+            best_epoch = ep+1
             save_checkpoint(CKPT_PATH, model, optimizer=opt, epoch=ep+1, extra={"train_loss": tr, "val_loss": va})
+
     # 최종 체크포인트 저장(선택)
     save_checkpoint(CKPT_PATH.replace(".pt", "_final.pt"), model, optimizer=opt, epoch=EPOCHS)
+
+# ===== TensorBoard: HParams 요약 기록 =====
+try:
+    hparam_dict = {
+        "T": T, "M": M, "D": D, "LAYERS": LAYERS, "HEADS": HEADS,
+        "lr": 2e-3, "weight_decay": 1e-4, "batch_size": 8, "epochs": EPOCHS
+    }
+    metric_dict = {}
+    if last_train is not None: metric_dict["final/train_loss"] = float(last_train)
+    if last_val   is not None: metric_dict["final/val_loss"]   = float(last_val)
+    if best_val   != float("inf"):
+        metric_dict["best/val_loss"] = float(best_val)
+        writer.add_text("best", f"best_val={best_val:.6f} @ epoch {best_epoch}")
+    writer.add_hparams(hparam_dict, metric_dict)
+except Exception as e:
+    print("[TensorBoard] add_hparams failed:", e)
 
 # ============================================================
 # 7) IG (Integrated Gradients) : 통합 축(모든 설정/스탯)
@@ -769,8 +747,6 @@ def ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB,
 # 8) Plotly HTML (interactive)
 # ---------------------
 def _diverging_colorscale(pos_green=True):
-    # pos_green=True: +는 초록 / -는 빨강  (Util)
-    # pos_green=False: +는 빨강 / -는 초록 (Latency)
     if pos_green:
         return [
             [0.0, "rgb(180,0,0)"],
@@ -786,12 +762,6 @@ def _diverging_colorscale(pos_green=True):
 
 def write_interactive_ig_heatmap(matrix_TxD, labels, html_path="ig_util_interactive.html",
                                  title="Integrated Gradients - Utilization", pos_green=True):
-    """
-    matrix_TxD: [T, D] (signed IG)
-    labels: list[str] length D
-    pos_green=True  -> +초록/−빨강 (util)
-    pos_green=False -> +빨강/−초록 (latency)
-    """
     if torch.is_tensor(matrix_TxD):
         Z = matrix_TxD.detach().cpu().numpy()
     else:
@@ -826,16 +796,11 @@ def write_interactive_latency_grid(
     mats_per_m, labels, cols=3, html_path="ig_latency_grid.html",
     title_prefix="Integrated Gradients - Latency"
 ):
-    """
-    mats_per_m: list of [T, D] (signed IG), 각 master별 매트릭스
-    """
-    # 공통 scale
     all_data = np.concatenate([
         (m.detach().cpu().numpy() if torch.is_tensor(m) else m) for m in mats_per_m
     ], axis=0)
     amax = np.nanmax(np.abs(all_data)) if np.isfinite(all_data).any() else 1.0
 
-    # latency 규칙: +빨강/−초록
     colors = [
         [0.0, "rgb(0,160,0)"],
         [0.5, "rgb(245,245,245)"],
@@ -845,14 +810,12 @@ def write_interactive_latency_grid(
     M = len(mats_per_m)
     rows = int(np.ceil(M / cols))
 
-    # 공식 서브플롯 API 사용 (공유 컬러바)
     fig = make_subplots(
         rows=rows, cols=cols,
         horizontal_spacing=0.06, vertical_spacing=0.12,
         subplot_titles=[f"{title_prefix} (m={i})" for i in range(M)]
     )
 
-    # 공용 coloraxis 사용
     fig.update_layout(coloraxis=dict(colorscale=colors, cmin=-amax, cmax=amax, colorbar=dict(title="IG (+red / −green)")))
 
     r = 1; c = 1
@@ -871,7 +834,6 @@ def write_interactive_latency_grid(
             row=r, col=c
         )
 
-        # Y축 라벨은 첫 컬럼만 촘촘히 표시 (너무 많으면 샘플링)
         step = max(1, len(labels) // 20)
         idxs = list(range(0, len(labels), step))
         if c == 1:
@@ -910,29 +872,23 @@ def build_token_labels(T, M):
         for m in range(M): labels.append(f"t{t}:SM[m{m}]")
         for m in range(M): labels.append(f"t{t}:CM[m{m}]")
         for m in range(M): labels.append(f"t{t}:CMD[m{m}]")
-    return labels  # length L = T*(3+3M)
+    return labels
 
 def write_interactive_attention(attn_maps, token_labels, html_path="attn_interactive.html",
                                 title="Attention (causal mask)"):
-    """
-    attn_maps: list of length = num_layers, each tensor [B,H,L,L]
-    token_labels: list[str] length L
-    저장: layer/head 드롭다운 포함 (인터랙티브)
-    """
     attn_np = []
     for A in attn_maps:
-        A = A.detach().cpu().numpy()  # [B,H,L,L]
+        A = A.detach().cpu().numpy()
         if A.shape[0] > 1:
             A = A.mean(axis=0, keepdims=False)
         else:
             A = A[0]
-        attn_np.append(A)  # [H,L,L]
+        attn_np.append(A)
 
     num_layers = len(attn_np)
     num_heads  = attn_np[0].shape[0]
     L = attn_np[0].shape[1]
 
-    # 초기 표시: 마지막 레이어, head-mean
     A0 = attn_np[-1].mean(axis=0)
 
     fig = go.Figure()
@@ -942,7 +898,6 @@ def write_interactive_attention(attn_maps, token_labels, html_path="attn_interac
         hovertemplate="Q(y)=%{y}<br>K(x)=%{x}<br>val=%{z:.4f}<extra></extra>"
     ))
 
-    # 축 라벨(혼잡 방지)
     step = max(1, L // 40)
     show_x = list(range(0, L, step))
     show_y = list(range(0, L, step))
@@ -963,9 +918,7 @@ def write_interactive_attention(attn_maps, token_labels, html_path="attn_interac
         height=max(600, min(1200, 24*step*2))
     )
 
-    # 드롭다운: 레이어/헤드 선택
     buttons = []
-    # head=mean
     for li in range(num_layers):
         z = attn_np[li].mean(axis=0)
         buttons.append(dict(
@@ -973,7 +926,6 @@ def write_interactive_attention(attn_maps, token_labels, html_path="attn_interac
             method="restyle",
             args=[{"z": [z]}, [0]]
         ))
-    # 각 head
     for li in range(num_layers):
         for hi in range(num_heads):
             z = attn_np[li][hi]
@@ -1000,10 +952,6 @@ def write_interactive_attention(attn_maps, token_labels, html_path="attn_interac
 # 9) Top/Bottom5 printer
 # ---------------------
 def print_top_bottom_over_time(matrix_TxD, labels, k=5, tag="Util"):
-    """
-    matrix_TxD: [T, Dtot] (signed IG)
-    각 time t에 대해 상위/하위 k개 피처와 값을 출력
-    """
     data = matrix_TxD.detach().cpu().numpy() if torch.is_tensor(matrix_TxD) else matrix_TxD
     Tn, Dtot = data.shape
     print(f"\n==== {tag}: Top{k} / Bottom{k} per time ====")
@@ -1044,7 +992,6 @@ def make_one_sample(device):
     X_cmd = torch.zeros(T, M, CMD, device=device)
     return X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd
 
-# 샘플 1개로 분석/IG
 model.eval()
 X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd = make_one_sample(device)
 with torch.no_grad():
@@ -1056,7 +1003,6 @@ print("\n=== Quick Analysis (B=1) ===")
 print("Util t0..4:", np.round(utilB[0,:5,0].detach().cpu().numpy(), 3))
 print("Lat  t0 m0..3:", np.round(latB[0,0,:4,0].detach().cpu().numpy(), 3))
 
-# IG 계산
 X_sgB  = X_sg.unsqueeze(0)
 X_smB  = X_sm.unsqueeze(0)
 X_cgB  = X_cg.unsqueeze(0)
@@ -1070,7 +1016,6 @@ util_mat = ig_util_combined_matrix(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_
 lat_mats = ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
                                                     steps=48, baseline_mode="zero", signed=True)
 
-# HTML 저장(인터랙티브)
 write_interactive_ig_heatmap(util_mat, labels_all,
                              html_path="util_ig_interactive.html",
                              title="IG - Utili (+g / −r)",
@@ -1080,11 +1025,9 @@ write_interactive_latency_grid(lat_mats, labels_all, cols=3,
                                html_path="latency_ig_grid.html",
                                title_prefix="IG - Lat (+r / −g)")
 
-# Top5 / Bottom5 출력
 print_top_bottom_over_time(util_mat, labels_all, k=5, tag="Util")
 print_top_bottom_latency_all_masters(lat_mats, labels_all, k=5)
 
-# 어텐션 HTML (레이어/헤드 드롭다운)
 tok_labels = build_token_labels(T, M)
 write_interactive_attention(attn_maps, tok_labels, html_path="attn_interactive.html")
 
@@ -1092,3 +1035,7 @@ print("\nDone. Check HTML files:")
 print("- util_ig_interactive.html")
 print("- latency_ig_grid.html")
 print("- attn_interactive.html")
+
+# ===== TensorBoard: 종료 =====
+writer.flush()
+writer.close()
