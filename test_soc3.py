@@ -6,6 +6,7 @@
 # - Random synthetic dataset (N=300)
 # - Mini-batch training
 # - Inference: B=1 또는 B>1 모두 동일 경로
+# - IG & Attention 결과를 Plotly HTML로 저장 (인터랙티브)
 # =========================
 
 import numpy as np
@@ -13,9 +14,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-import matplotlib.pyplot as plt
-from matplotlib import colors
 
+# ----- Plotly (interactive html) -----
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 # ---------------------
 # 0) Repro & device
 # ---------------------
@@ -110,7 +113,51 @@ class SocDataset(Dataset):
 
 # ---------------------
 # 4) Model (single encoder, block-causal, batch-only)
-# ---------------------
+# --------------------
+class EncoderLayerWithAttn(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, activation="gelu", batch_first=True):
+        super().__init__()
+        assert batch_first, "batch_first=True 가정"
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.activation = getattr(F, activation) if isinstance(activation, str) else activation
+
+    def forward(self, x, attn_mask=None):
+        # Multi-head Self-Attention (가중치 수집)
+        attn_out, attn_w = self.self_attn(
+            x, x, x,
+            attn_mask=attn_mask,
+            need_weights=True,
+            average_attn_weights=False  # -> [B, num_heads, L, L]
+        )
+        x = x + self.dropout1(attn_out)
+        x = self.norm1(x)
+        # FFN
+        y = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = x + self.dropout2(y)
+        x = self.norm2(x)
+        return x, attn_w  # (B, H, L, L)
+
+class TransformerEncoderWithAttn(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, num_layers, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            EncoderLayerWithAttn(d_model, nhead, dim_feedforward, dropout=dropout, activation="gelu", batch_first=True)
+        for _ in range(num_layers)])
+    
+    def forward(self, x, attn_mask=None):
+        attn_maps = []  # list of [B,H,L,L] per layer
+        for layer in self.layers:
+            x, attn_w = layer(x, attn_mask=attn_mask)
+            attn_maps.append(attn_w)
+        return x, attn_maps
+
 class MLP(nn.Module):
     def __init__(self, i, o, h=96):
         super().__init__()
@@ -140,8 +187,9 @@ class OneEncoder(nn.Module):
         self.master_emb = nn.Embedding(M, D)
         self.time_emb   = nn.Embedding(T, D)
         # encoder
-        enc_layer = nn.TransformerEncoderLayer(d_model=D, nhead=heads, dim_feedforward=4*D, batch_first=True, activation="gelu")
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
+        self.encoder = TransformerEncoderWithAttn(
+            d_model=D, nhead=heads, dim_feedforward=4*D, num_layers=LAYERS, dropout=0.1
+        )
         # heads
         self.head_util    = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Sigmoid())
         self.head_latency = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Softplus())
@@ -206,22 +254,22 @@ class OneEncoder(nn.Module):
 
     # ---- 분석(배치)
     def analysis_batch(self, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB):
-        Xtok = self._pack_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)       # [B,L,D]
-        mask = self._build_block_causal_mask(Xtok.device)                         # [L,L]
-        H = self.encoder(Xtok, mask=mask)                                         # [B,L,D]
+        Xtok = self._pack_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)  # [B,L,D]
+        mask = self._build_block_causal_mask(Xtok.device)                    # [L,L]
+        H, attn_maps = self.encoder(Xtok, attn_mask=mask)                    # H:[B,L,D], attn_maps: list[LAYER][B,H,L,L]
 
         B = X_sgB.size(0)
         H = H.view(B, self.T, self.S_PER_T, self.D)
-        h_sg   = H[:,:,0,:]                               # [B,T,D]
-        h_cgd  = H[:,:,2,:]                               # [B,T,D]
-        h_sm   = H[:,:,3:3+self.M,:]                      # [B,T,M,D]
-        h_cmd  = H[:,:,3+2*self.M:3+3*self.M,:]           # [B,T,M,D]
+        h_sg   = H[:,:,0,:]
+        h_cgd  = H[:,:,2,:]
+        h_sm   = H[:,:,3:3+self.M,:]
+        h_cmd  = H[:,:,3+2*self.M:3+3*self.M,:]
 
-        util = self.head_util(h_sg)                       # [B,T,1]
-        lat  = self.head_latency(h_sm)                    # [B,T,M,1]
-        nsg  = self.head_next_sg(h_cgd)                   # [B,T,SG]
-        nsm  = self.head_next_sm(h_cmd)                   # [B,T,M,SM]
-        return util, lat, nsg, nsm
+        util = self.head_util(h_sg)            # [B,T,1]
+        lat  = self.head_latency(h_sm)         # [B,T,M,1]
+        nsg  = self.head_next_sg(h_cgd)        # [B,T,SG]
+        nsm  = self.head_next_sm(h_cmd)        # [B,T,M,SM]
+        return util, lat, nsg, nsm, attn_maps  # attn_maps: list of [B,H,L,L]
 
     # ---- 롤아웃(배치)
     def rollout_batch(self, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB):
@@ -284,14 +332,12 @@ class OneEncoder(nn.Module):
             Lk = (k+1) * self.S_PER_T
 
             # ----- prefix용 block-causal mask (slice) -----
-            # 풀마스크 만들기보다, 여기서 직접 만들거나, 빌드해둔 풀마스크를 [:Lk,:Lk]로 슬라이스해도 됨
             mask = torch.full((Lk, Lk), float('-inf'), device=dev)
-            # strictly causal: 각 시점 블록이 과거 블록들만 보도록
             for t in range(k+1):
                 for kk in range(t+1):
                     mask[t*self.S_PER_T:(t+1)*self.S_PER_T, kk*self.S_PER_T:(kk+1)*self.S_PER_T] = 0.0
             
-            H = self.encoder(Xtok, mask=mask)  # [B,Lk,D]
+            H, _ = self.encoder(Xtok, attn_mask=mask)  # [B,Lk,D]
 
             # k 시점 출력 읽기 (prefix 기준 index)
             base = k * self.S_PER_T
@@ -330,8 +376,7 @@ class OneEncoder(nn.Module):
 # ---------------------
 model = OneEncoder(T, M, D, SG, SM, CG, CGD, CM, CMD, layers=LAYERS, heads=HEADS).to(device)
 
-print("Make dataset...")
-full_ds = SocDataset(N=1000, rollout_deltas=False)   # 필요시 1000으로 변경
+full_ds = SocDataset(N=1000, rollout_deltas=False)
 n_total = len(full_ds)
 n_train = int(n_total * 0.8)
 n_val   = n_total - n_train
@@ -362,7 +407,7 @@ criterion = MAPELoss()
 def to_device_batch(batch, device, non_blocking=True):
     return [x.to(device, non_blocking=non_blocking) for x in batch]
 
-EPOCHS = 2  # 데모: 작게, 성능 확인 후 늘리세요
+EPOCHS = 2  # 데모
 for ep in range(EPOCHS):
     model.train()
     total=0
@@ -373,7 +418,7 @@ for ep in range(EPOCHS):
     total_nsm = 0
     for batch in train_loader:
         X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB, y_utilB, y_latB, y_nsgB, y_nsmB = to_device_batch(batch, device)
-        util, lat, nsg, nsm = model.analysis_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
+        util, lat, nsg, nsm, _ = model.analysis_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
 
         l_util = criterion(util, y_utilB)
         l_lat  = criterion(lat,  y_latB)
@@ -385,7 +430,6 @@ for ep in range(EPOCHS):
 
         total += loss.item()
         steps += 1
-        
         total_util += l_util.item()
         total_lat += l_lat.item()
         total_nsg += l_nsg.item()
@@ -396,7 +440,7 @@ for ep in range(EPOCHS):
     with torch.no_grad():
         for batch in val_loader:
             X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB, y_utilB, y_latB, y_nsgB, y_nsmB = to_device_batch(batch, device)
-            util, lat, nsg, nsm = model.analysis_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
+            util, lat, nsg, nsm, _ = model.analysis_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
 
             l_util = criterion(util, y_utilB)
             l_lat  = criterion(lat,  y_latB)
@@ -493,7 +537,7 @@ def ig_util_combined_matrix(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
                   X_cmB.clone().detach(), X_cmdB.clone().detach()]
         def forward_fn(x_list):
             X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd = x_list
-            util, _, _, _ = model.analysis_batch(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
+            util, _, _, _, _ = model.analysis_batch(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
             return util[0, t, 0]
         A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd = _integrated_gradients(model, inputs, forward_fn, steps=steps, baseline_mode=baseline_mode)
         mat_t = concat_attrs_timewise(A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd, signed=signed)
@@ -515,7 +559,7 @@ def ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB,
                       X_cmB.clone().detach(), X_cmdB.clone().detach()]
             def forward_fn(x_list, tt=t, mm=m):
                 X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd = x_list
-                _, lat, _, _ = model.analysis_batch(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
+                _, lat, _, _, _ = model.analysis_batch(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
                 return lat[0, tt, mm, 0]
             A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd = _integrated_gradients(model, inputs, lambda z: forward_fn(z, t, m), steps=steps, baseline_mode=baseline_mode)
             mat_t = concat_attrs_timewise(A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd, signed=signed)
@@ -524,57 +568,235 @@ def ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB,
     return mats_per_m
 
 # ---------------------
-# 8) Plot (save to files; background)
+# 8) Plotly HTML (interactive)
 # ---------------------
-def save_util_heatmap(matrix_TxD, labels, out_path="util_ig_heatmap.png", title="Utilization IG Heatmap"):
-    data = matrix_TxD.detach().cpu().numpy() if torch.is_tensor(matrix_TxD) else matrix_TxD
-    vmax = np.nanmax(np.abs(data))
-    norm = colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
-    plt.figure(figsize=(10, max(4, 0.04*len(labels) + 3)))
-    im = plt.imshow(data.T, aspect='auto', origin='lower',
-                    cmap='RdYlGn', norm=norm)  # + green, - red
-    cbar = plt.colorbar(im, label='IG attribution (+ green, − red)')
-    cbar.ax.set_ylabel('IG attribution (+ green, − red)', rotation=90, va='center')
-    plt.xlabel('time')
-    plt.ylabel('features (stats & configs)')
-    plt.title(title)
-    step = max(1, len(labels) // 30)
-    idxs = np.arange(0, len(labels), step)
-    plt.yticks(idxs, [labels[i] for i in idxs], fontsize=8)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"[saved] {out_path}")
+def _diverging_colorscale(pos_green=True):
+    # pos_green=True: +는 초록 / -는 빨강  (Util)
+    # pos_green=False: +는 빨강 / -는 초록 (Latency)
+    if pos_green:
+        return [
+            [0.0, "rgb(180,0,0)"],
+            [0.5, "rgb(245,245,245)"],
+            [1.0, "rgb(0,160,0)"]
+        ]
+    else:
+        return [
+            [0.0, "rgb(0,160,0)"],
+            [0.5, "rgb(245,245,245)"],
+            [1.0, "rgb(180,0,0)"]
+        ]
 
-def save_latency_heatmaps_grid(mats_per_m, labels, cols=4, out_path="latency_ig_heatmaps_grid.png", title_prefix="Latency IG"):
+def write_interactive_ig_heatmap(matrix_TxD, labels, html_path="ig_util_interactive.html",
+                                 title="Integrated Gradients - Utilization", pos_green=True):
+    """
+    matrix_TxD: [T, D] (signed IG)
+    labels: list[str] length D
+    pos_green=True  -> +초록/−빨강 (util)
+    pos_green=False -> +빨강/−초록 (latency)
+    """
+    if torch.is_tensor(matrix_TxD):
+        Z = matrix_TxD.detach().cpu().numpy()
+    else:
+        Z = np.asarray(matrix_TxD)
+
+    Tn, Dtot = Z.shape
+    amax = np.nanmax(np.abs(Z)) if np.isfinite(Z).any() else 1.0
+    colors = _diverging_colorscale(pos_green=pos_green)
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        z=Z.T,
+        x=list(range(Tn)),
+        y=labels,
+        colorscale=colors,
+        zmin=-amax, zmax=amax,
+        colorbar=dict(title="IG"),
+        hovertemplate="t=%{x}<br>feat=%{y}<br>IG=%{z:.4f}<extra></extra>"
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="time (t)",
+        yaxis_title="features",
+        width=max(900, min(1600, 28*Tn)),
+        height=max(700, min(1500, 22*len(labels))),
+        margin=dict(l=140, r=40, t=60, b=80)
+    )
+    pio.write_html(fig, file=html_path, auto_open=False)
+    print(f"[saved] {html_path}")
+
+def write_interactive_latency_grid(
+    mats_per_m, labels, cols=3, html_path="ig_latency_grid.html",
+    title_prefix="Integrated Gradients - Latency"
+):
+    """
+    mats_per_m: list of [T, D] (signed IG), 각 master별 매트릭스
+    """
+    # 공통 scale
+    all_data = np.concatenate([
+        (m.detach().cpu().numpy() if torch.is_tensor(m) else m) for m in mats_per_m
+    ], axis=0)
+    amax = np.nanmax(np.abs(all_data)) if np.isfinite(all_data).any() else 1.0
+
+    # latency 규칙: +빨강/−초록
+    colors = [
+        [0.0, "rgb(0,160,0)"],
+        [0.5, "rgb(245,245,245)"],
+        [1.0, "rgb(180,0,0)"]
+    ]
+
     M = len(mats_per_m)
     rows = int(np.ceil(M / cols))
-    all_data = np.concatenate([ (m.detach().cpu().numpy() if torch.is_tensor(m) else m) for m in mats_per_m ], axis=0)
-    vmax = np.nanmax(np.abs(all_data))
-    norm = colors.TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
 
-    fig = plt.figure(figsize=(4.8*cols, 3.2*rows + 0.04*len(labels)))
-    for m, mat in enumerate(mats_per_m):
-        mat_np = mat.detach().cpu().numpy() if torch.is_tensor(mat) else mat
-        ax = plt.subplot(rows, cols, m+1)
-        im = ax.imshow(mat_np.T, aspect='auto', origin='lower',
-                       cmap='RdYlGn_r', norm=norm)  # + red, - green
-        ax.set_title(f"{title_prefix} (m={m})")
-        ax.set_xlabel('time')
-        if m % cols == 0:
-            step = max(1, len(labels) // 20)
-            idxs = np.arange(0, len(labels), step)
-            ax.set_yticks(idxs)
-            ax.set_yticklabels([labels[i] for i in idxs], fontsize=7)
+    # 공식 서브플롯 API 사용 (공유 컬러바)
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        horizontal_spacing=0.06, vertical_spacing=0.12,
+        subplot_titles=[f"{title_prefix} (m={i})" for i in range(M)]
+    )
+
+    # 공용 coloraxis 사용
+    fig.update_layout(coloraxis=dict(colorscale=colors, cmin=-amax, cmax=amax, colorbar=dict(title="IG (+red / −green)")))
+
+    r = 1; c = 1
+    for mi, mat in enumerate(mats_per_m):
+        Z = mat.detach().cpu().numpy() if torch.is_tensor(mat) else np.asarray(mat)
+        Tn, Dtot = Z.shape
+
+        fig.add_trace(
+            go.Heatmap(
+                z=Z.T,
+                x=list(range(Tn)),
+                y=labels,
+                coloraxis="coloraxis",
+                hovertemplate=f"m={mi} | t=%{{x}}<br>feat=%{{y}}<br>IG=%{{z:.4f}}<extra></extra>"
+            ),
+            row=r, col=c
+        )
+
+        # Y축 라벨은 첫 컬럼만 촘촘히 표시 (너무 많으면 샘플링)
+        step = max(1, len(labels) // 20)
+        idxs = list(range(0, len(labels), step))
+        if c == 1:
+            fig.update_yaxes(
+                tickmode="array",
+                tickvals=idxs,
+                ticktext=[labels[i] for i in idxs],
+                row=r, col=c
+            )
         else:
-            ax.set_yticks([])
-    # 공용 컬러바
-    cbar = fig.colorbar(im, ax=fig.axes, orientation='horizontal', fraction=0.035, pad=0.03)
-    cbar.set_label('IG attribution (+ red, − green)')
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-    print(f"[saved] {out_path}")
+            fig.update_yaxes(showticklabels=False, row=r, col=c)
+
+        fig.update_xaxes(title_text="time", row=r, col=c)
+
+        c += 1
+        if c > cols:
+            c = 1; r += 1
+
+    fig.update_layout(
+        title="Latency IG (interactive grid)",
+        width=1200,
+        height=300*rows + int(0.04*len(labels)*300),
+        margin=dict(l=140, r=80, t=60, b=80)
+    )
+
+    pio.write_html(fig, file=html_path, auto_open=False)
+    print(f"[saved] {html_path}")
+
+# ----- Attention (interactive) -----
+def build_token_labels(T, M):
+    labels = []
+    for t in range(T):
+        labels.append(f"t{t}:SG")
+        labels.append(f"t{t}:CG")
+        labels.append(f"t{t}:CGD")
+        for m in range(M): labels.append(f"t{t}:SM[m{m}]")
+        for m in range(M): labels.append(f"t{t}:CM[m{m}]")
+        for m in range(M): labels.append(f"t{t}:CMD[m{m}]")
+    return labels  # length L = T*(3+3M)
+
+def write_interactive_attention(attn_maps, token_labels, html_path="attn_interactive.html",
+                                title="Attention (causal mask)"):
+    """
+    attn_maps: list of length = num_layers, each tensor [B,H,L,L]
+    token_labels: list[str] length L
+    저장: layer/head 드롭다운 포함 (인터랙티브)
+    """
+    attn_np = []
+    for A in attn_maps:
+        A = A.detach().cpu().numpy()  # [B,H,L,L]
+        if A.shape[0] > 1:
+            A = A.mean(axis=0, keepdims=False)
+        else:
+            A = A[0]
+        attn_np.append(A)  # [H,L,L]
+
+    num_layers = len(attn_np)
+    num_heads  = attn_np[0].shape[0]
+    L = attn_np[0].shape[1]
+
+    # 초기 표시: 마지막 레이어, head-mean
+    A0 = attn_np[-1].mean(axis=0)
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        z=A0, x=list(range(L)), y=list(range(L)),
+        colorscale="Magma", colorbar=dict(title="attention"),
+        hovertemplate="Q(y)=%{y}<br>K(x)=%{x}<br>val=%{z:.4f}<extra></extra>"
+    ))
+
+    # 축 라벨(혼잡 방지)
+    step = max(1, L // 40)
+    show_x = list(range(0, L, step))
+    show_y = list(range(0, L, step))
+    fig.update_xaxes(
+        tickmode="array", tickvals=show_x,
+        ticktext=[token_labels[i] for i in show_x]
+    )
+    fig.update_yaxes(
+        tickmode="array", tickvals=show_y,
+        ticktext=[token_labels[i] for i in show_y]
+    )
+
+    fig.update_layout(
+        title=f"{title} | layer=last, head=mean",
+        xaxis_title="Key tokens (x)",
+        yaxis_title="Query tokens (y)",
+        width=max(800, min(1600, 24*step*2)),
+        height=max(600, min(1200, 24*step*2))
+    )
+
+    # 드롭다운: 레이어/헤드 선택
+    buttons = []
+    # head=mean
+    for li in range(num_layers):
+        z = attn_np[li].mean(axis=0)
+        buttons.append(dict(
+            label=f"layer {li}, head=mean",
+            method="restyle",
+            args=[{"z": [z]}, [0]]
+        ))
+    # 각 head
+    for li in range(num_layers):
+        for hi in range(num_heads):
+            z = attn_np[li][hi]
+            buttons.append(dict(
+                label=f"layer {li}, head {hi}",
+                method="restyle",
+                args=[{"z": [z]}, [0]]
+            ))
+
+    fig.update_layout(
+        updatemenus=[
+            dict(
+                buttons=buttons,
+                direction="down", showactive=True, x=1.02, xanchor="left", y=1, yanchor="top"
+            )
+        ],
+        margin=dict(l=80, r=220, t=60, b=80)
+    )
+
+    pio.write_html(fig, file=html_path, auto_open=False)
+    print(f"[saved] {html_path}")
 
 # ---------------------
 # 9) Top/Bottom5 printer
@@ -589,20 +811,14 @@ def print_top_bottom_over_time(matrix_TxD, labels, k=5, tag="Util"):
     print(f"\n==== {tag}: Top{k} / Bottom{k} per time ====")
     for t in range(Tn):
         row = data[t]
-        # Top-k positive
         top_idx = np.argsort(-row)[:k]
-        # Bottom-k negative
         bot_idx = np.argsort(row)[:k]
-        top = [(labels[i], float(row[i])) for i in top_idx]
-        bot = [(labels[i], float(row[i])) for i in bot_idx]
+        top = [(labels[i], f"{float(row[i]):.4f}") for i in top_idx]
+        bot = [(labels[i], f"{float(row[i]):.4f}") for i in bot_idx]
         print(f"[t={t}] Top{k}: {top}")
         print(f"[t={t}] Bottom{k}: {bot}")
 
 def print_top_bottom_latency_all_masters(mats_per_m, labels, k=5):
-    """
-    mats_per_m: list of [T, Dtot] (signed)
-    각 master m, time t에 대해 Top/Bottom k 출력
-    """
     print(f"\n==== Latency: Top{ k } / Bottom{ k } per time & master ====")
     for m, mat in enumerate(mats_per_m):
         data = mat.detach().cpu().numpy() if torch.is_tensor(mat) else mat
@@ -612,13 +828,13 @@ def print_top_bottom_latency_all_masters(mats_per_m, labels, k=5):
             row = data[t]
             top_idx = np.argsort(-row)[:k]
             bot_idx = np.argsort(row)[:k]
-            top = [(labels[i], float(row[i])) for i in top_idx]
-            bot = [(labels[i], float(row[i])) for i in bot_idx]
+            top = [(labels[i], f"{float(row[i]):.4f}") for i in top_idx]
+            bot = [(labels[i], f"{float(row[i]):.4f}") for i in bot_idx]
             print(f"[t={t}] Top{k}: {top}")
             print(f"[t={t}] Bottom{k}: {bot}")
 
 # ============================================================
-# 10) Inference + IG + Save + Print
+# 10) Inference + IG + Save(HTML) + Print
 # ============================================================
 @torch.no_grad()
 def make_one_sample(device):
@@ -634,7 +850,7 @@ def make_one_sample(device):
 model.eval()
 X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd = make_one_sample(device)
 with torch.no_grad():
-    utilB, latB, nsgB, nsmB = model.analysis_batch(
+    utilB, latB, nsgB, nsmB, attn_maps = model.analysis_batch(
         X_sg.unsqueeze(0), X_sm.unsqueeze(0), X_cg.unsqueeze(0), X_cgd.unsqueeze(0),
         X_cm.unsqueeze(0), X_cmd.unsqueeze(0)
     )
@@ -656,15 +872,25 @@ util_mat = ig_util_combined_matrix(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_
 lat_mats = ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
                                                     steps=48, baseline_mode="zero", signed=True)
 
-# 파일 저장(백그라운드)
-save_util_heatmap(util_mat, labels_all, out_path="util_ig_heatmap.png",
-                  title="Utilization IG (signed: + green, − red)")
-save_latency_heatmaps_grid(lat_mats, labels_all, cols=4,
-                           out_path="latency_ig_heatmaps_grid.png",
-                           title_prefix="Latency IG (signed: + red, − green)")
+# HTML 저장(인터랙티브)
+write_interactive_ig_heatmap(util_mat, labels_all,
+                             html_path="util_ig_interactive.html",
+                             title="Integrated Gradients - Utilization (+green / −red)",
+                             pos_green=True)
+
+write_interactive_latency_grid(lat_mats, labels_all, cols=3,
+                               html_path="latency_ig_grid.html",
+                               title_prefix="Integrated Gradients - Latency (+red / −green)")
 
 # Top5 / Bottom5 출력
 print_top_bottom_over_time(util_mat, labels_all, k=5, tag="Util")
 print_top_bottom_latency_all_masters(lat_mats, labels_all, k=5)
 
-print("\nDone. Check the saved files: 'util_ig_heatmap.png', 'latency_ig_heatmaps_grid.png'")
+# 어텐션 HTML (레이어/헤드 드롭다운)
+tok_labels = build_token_labels(T, M)
+write_interactive_attention(attn_maps, tok_labels, html_path="attn_interactive.html")
+
+print("\nDone. Check HTML files:")
+print("- util_ig_interactive.html")
+print("- latency_ig_grid.html")
+print("- attn_interactive.html")

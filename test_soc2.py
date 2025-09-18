@@ -98,6 +98,7 @@ class SocDataset(Dataset):
             X_sg  = torch.rand(T, SG)
             X_sm  = torch.rand(T, M, SM)
             #X_sm[..., REMAIN_IDX] = 100  # start remaining BW
+            #print(X_sm)
             X_cg  = torch.rand(T, CG)
             X_cm  = torch.rand(T, M, CM)
             if rollout_deltas:
@@ -272,7 +273,6 @@ class OneEncoder(nn.Module):
 # ---------------------
 model = OneEncoder(T, M, D, SG, SM, CG, CGD, CM, CMD, layers=LAYERS, heads=HEADS).to(device)
 
-print("Make dataset")
 full_ds = SocDataset(N=300, rollout_deltas=False)
 n_total = len(full_ds)         # 1000
 n_train = int(n_total * 0.8)   # 80%
