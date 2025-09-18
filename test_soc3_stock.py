@@ -20,7 +20,6 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
-from typing import Union, Callable, Optional
 import os
 # ---------------------
 # 0) Repro & device
@@ -117,182 +116,130 @@ class SocDataset(Dataset):
 # ---------------------
 # 4) Model (single encoder, block-causal, batch-only)
 # --------------------
-class StockEquivalentEncoderLayerWithAttn(nn.Module):
+class TransformerEncoderLayerWithAttn(nn.Module):
     """
-    nn.TransformerEncoderLayer와 완전히 동일한 구조/순서/초기화(=PyTorch 기본 초기화)를 사용.
-    차이: attention map을 반환할 수 있도록 need_weights=True로 호출.
-    - Post-LN (norm_first=False) 가정 -> stock 기본값과 동일
-    - batch_first=True
+    stock nn.TransformerEncoderLayer와 파라미터/초기화/포워드 흐름을 동일하게 유지.
+    차이: forward에서 (x, attn_weights) 반환.
     """
+    __constants__ = ['batch_first', 'norm_first']
     def __init__(
         self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int = 2048,
-        dropout: float = 0.1,
-        activation: Union[str, Callable] = "gelu",
-        batch_first: bool = True,
-        norm_first: bool = False,   # stock 기본: False (Post-LN)
-        layer_norm_eps: float = 1e-5
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.1,
+        activation="relu",         # stock 기본은 relu (원하면 "gelu"로 맞춰도 OK)
+        layer_norm_eps=1e-5,       # stock 기본 eps
+        batch_first=True,          # 최근 stock 기본 False였지만 우리는 True로 쓰니 명시
+        norm_first=False           # stock 기본 False (post-norm)
     ):
         super().__init__()
-        assert batch_first, "stock 예제에 맞춰 batch_first=True만 지원"
+        self.batch_first = batch_first
+        self.norm_first = norm_first
 
         self.self_attn = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=nhead,
             dropout=dropout,
-            batch_first=True
+            batch_first=batch_first,
+            bias=True,             # stock과 동일
+            add_zero_attn=False,   # stock과 동일
+            kdim=None, vdim=None   # stock과 동일
         )
 
-        # Feedforward 부분: Linear -> activation -> Dropout -> Linear
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        # FFN
+        self.linear1 = nn.Linear(d_model, dim_feedforward, bias=True)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, bias=True)
 
-        # Dropout & LayerNorm
-        self.dropout1 = nn.Dropout(dropout)  # attn residual
-        self.dropout2 = nn.Dropout(dropout)  # ffn residual
+        # Norm + Dropout
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-        # Activation
+        # activation
         if isinstance(activation, str):
-            if activation == "gelu":
-                self.activation = F.gelu
-            elif activation == "relu":
+            if activation == "relu":
                 self.activation = F.relu
+            elif activation == "gelu":
+                self.activation = F.gelu
             else:
-                raise ValueError("activation must be 'gelu' or 'relu' (stock와 동일 범위)")
+                raise ValueError("activation must be 'relu' or 'gelu'")
         else:
             self.activation = activation
 
-        # stock 기본과 동일: 별도 재초기화 불필요(서브모듈의 기본 init 사용)
-        # (MultiheadAttention: xavier_uniform_ / Linear: kaiming_uniform_ / LN: weight=1, bias=0)
+        self._reset_parameters_like_stock()
 
-        self.norm_first = norm_first  # 필요 시 Pre-LN로 바꿀 수 있음 (stock 옵션과 동일)
+    def _reset_parameters_like_stock(self):
+        # stock: transformer.py _reset_parameters -> 모든 2D weight에 xavier_uniform_
+        for p in self.parameters():
+            if p.dim() > 1:
+                xavier_uniform_(p)
+            else:
+                # bias는 Linear 기본과 다르게 stock은 0으로 두는 경향이 강함
+                # (MultiheadAttention은 명시적으로 0, Linear는 위 루프에서 안 건드림)
+                # 안전하게 0 세팅
+                nn.init.zeros_(p)
 
-    def forward(self, src, attn_mask=None, key_padding_mask=None, need_weights=True):
+    def _sa_block(self, x, attn_mask=None):
+        # stock에서는 key_padding_mask 등 더 많은 인자를 받지만,
+        # 여기선 causal attn_mask만 쓰는 케이스로 맞춤
+        attn_out, attn_w = self.self_attn(
+            x, x, x,
+            attn_mask=attn_mask,
+            need_weights=True,
+            average_attn_weights=False  # [B, H, L, L]
+        )
+        return attn_out, attn_w
+
+    def _ff_block(self, x):
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return x
+
+    def forward(self, x, attn_mask=None):
         """
-        src: [B, L, D]
-        attn_mask: [L, L] 또는 [B * num_heads, L, L] 등 stock과 동일 규격
-        key_padding_mask: [B, L] (True=ignore)
-        need_weights: True면 layer의 attn map 반환 (shape: [B, H, L, L])
+        x: [B,L,D] (batch_first=True)
+        attn_mask: [L, L] additive mask (stock semantics)
+        return: (out, attn_maps) where attn_maps is [B,H,L,L]
         """
+        attn_maps = None
+
         if self.norm_first:
-            # Pre-LN 경로 (stock norm_first=True와 동일)
-            x = self.norm1(src)
-            attn_out, attn_w = self.self_attn(
-                x, x, x,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=True,                 # 항상 뽑아두고 need_weights로 반환 제어
-                average_attn_weights=False         # [B,H,L,L]
-            )
-            src = src + self.dropout1(attn_out)
-            x = self.norm2(src)
-            y = self.linear2(self.dropout(self.activation(self.linear1(x))))
-            src = src + self.dropout2(y)
+            # pre-norm
+            attn_out, attn_w = self._sa_block(self.norm1(x), attn_mask)
+            x = x + self.dropout1(attn_out)
+            x = x + self.dropout2(self._ff_block(self.norm2(x)))
+            attn_maps = attn_w
         else:
-            # Post-LN 경로 (stock 기본)
-            attn_out, attn_w = self.self_attn(
-                src, src, src,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=True,                 # 항상 뽑아두고 need_weights로 반환 제어
-                average_attn_weights=False
-            )
-            src = src + self.dropout1(attn_out)
-            src = self.norm1(src)
+            # post-norm (stock 기본)
+            attn_out, attn_w = self._sa_block(x, attn_mask)
+            x = self.norm1(x + self.dropout1(attn_out))
+            x = self.norm2(x + self.dropout2(self._ff_block(x)))
+            attn_maps = attn_w
 
-            y = self.linear2(self.dropout(self.activation(self.linear1(src))))
-            src = src + self.dropout2(y)
-            src = self.norm2(src)
+        return x, attn_maps
 
-        if need_weights:
-            return src, attn_w  # [B,H,L,L]
-        else:
-            return src, None
-
-    @torch.no_grad()
-    def load_from_stock(self, stock_layer: nn.TransformerEncoderLayer):
-        """
-        stock(nn.TransformerEncoderLayer)에서 가중치를 그대로 복사하여
-        완전히 같은 출력을 내도록 함.
-        """
-        # MHA
-        self.self_attn.load_state_dict(stock_layer.self_attn.state_dict())
-        # FFN
-        self.linear1.load_state_dict(stock_layer.linear1.state_dict())
-        self.linear2.load_state_dict(stock_layer.linear2.state_dict())
-        # Norms
-        self.norm1.load_state_dict(stock_layer.norm1.state_dict())
-        self.norm2.load_state_dict(stock_layer.norm2.state_dict())
-        # Dropout 확률 등은 생성자에서 동일하게 만들었으므로 OK
-        # 활성함수/순서/옵션도 동일해야 함
-        return self
-
-
-# -------------------------------
-# Stock-equivalent Encoder(+maps)
-# -------------------------------
-class StockEquivalentTransformerEncoder(nn.Module):
-    """
-    stock `nn.TransformerEncoder`와 동일한 레이어 스택, forward 순서.
-    차이: 각 레이어의 attention map을 리스트로 모아 반환 가능.
-    """
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dim_feedforward: int,
-        num_layers: int,
-        dropout: float = 0.1,
-        activation: Union[str, Callable] = "gelu",
-        batch_first: bool = True,
-        norm_first: bool = False,
-        layer_norm_eps: float = 1e-5
-    ):
+class TransformerEncoderWithAttn(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, num_layers,
+                 dropout=0.1, activation="relu", layer_norm_eps=1e-5,
+                 batch_first=True, norm_first=False):
         super().__init__()
         self.layers = nn.ModuleList([
-            StockEquivalentEncoderLayerWithAttn(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                activation=activation,
-                batch_first=batch_first,
-                norm_first=norm_first,
-                layer_norm_eps=layer_norm_eps
+            TransformerEncoderLayerWithAttn(
+                d_model, nhead, dim_feedforward, dropout=dropout,
+                activation=activation, layer_norm_eps=layer_norm_eps,
+                batch_first=batch_first, norm_first=norm_first
             )
             for _ in range(num_layers)
         ])
 
-    def forward(self, x, attn_mask=None, key_padding_mask=None, need_attn_maps: bool = True):
-        """
-        x: [B,L,D]
-        return:
-          H: [B,L,D]
-          attn_maps: Optional[list of [B,H,L,L]]
-        """
-        attn_maps = [] if need_attn_maps else None
+    def forward(self, x, attn_mask=None):
+        attn_maps_all = []
         for layer in self.layers:
-            x, attn_w = layer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_attn_maps)
-            if need_attn_maps:
-                attn_maps.append(attn_w)  # 각 레이어의 [B,H,L,L]
-        return x, attn_maps
-
-    @torch.no_grad()
-    def load_from_stock(self, stock_encoder: nn.TransformerEncoder):
-        """
-        stock(nn.TransformerEncoder)에서 가중치 복사.
-        주의: stock과 같은 num_layers/구성이어야 함.
-        """
-        stock_layers = list(stock_encoder.layers)
-        assert len(stock_layers) == len(self.layers), "layer 수가 동일해야 복사 가능"
-        for my, st in zip(self.layers, stock_layers):
-            my.load_from_stock(st)
-        return self
+            x, attn_w = layer(x, attn_mask=attn_mask)
+            attn_maps_all.append(attn_w)  # 각 레이어의 [B,H,L,L]
+        return x, attn_maps_all
 
 class MLP(nn.Module):
     def __init__(self, i, o, h=96):
@@ -322,34 +269,18 @@ class OneEncoder(nn.Module):
         self.type_emb   = nn.Embedding(7, D)   # 0..5 types, 6=PAD(미사용)
         self.master_emb = nn.Embedding(M, D)
         self.time_emb   = nn.Embedding(T, D)
-        
-        # ======================================================
-        # 1) stock 인코더를 "초기화 용도"로 한 번 만든다
-        # ======================================================
-        stock_layer = nn.TransformerEncoderLayer(
-            d_model=D, nhead=heads, dim_feedforward=4*D,
-            dropout=0.1, batch_first=True, activation="gelu",
-            norm_first=False
-        )
-        stock_encoder = nn.TransformerEncoder(stock_layer, num_layers=layers)
-        
-        # ======================================================
-        # 2) custom 인코더를 같은 하이퍼파라미터로 만들고
-        #    stock에서 가중치를 그대로 복사한다 (bit-exact)
-        # ======================================================
-        self.encoder = StockEquivalentTransformerEncoder(
-            d_model=D, nhead=heads, dim_feedforward=4*D,
-            num_layers=layers, dropout=0.1,
-            activation="gelu", batch_first=True, norm_first=False
-        )
-        # stock -> custom 가중치 복사
-        self.encoder.load_from_stock(stock_encoder)
-
+        # encoder
+        enc_layer = nn.TransformerEncoderLayer(d_model=D, nhead=heads, dim_feedforward=4*D, batch_first=True, activation="gelu")
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=layers)
         # heads
         self.head_util    = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Sigmoid())
         self.head_latency = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Softplus())
         self.head_next_sg = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,SG))
         self.head_next_sm = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,SM))
+
+        for name, param in self.encoder.named_parameters():
+            print(name, param.shape)
+        assert(0)
 
     def _build_block_causal_mask(self, device):
         L = self.T * self.S_PER_T
@@ -411,8 +342,8 @@ class OneEncoder(nn.Module):
     def analysis_batch(self, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB):
         Xtok = self._pack_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)  # [B,L,D]
         mask = self._build_block_causal_mask(Xtok.device)                    # [L,L]
-        H, attn_maps = self.encoder(Xtok, attn_mask=mask)                    # H:[B,L,D], attn_maps: list[LAYER][B,H,L,L]
-
+        H = self.encoder(Xtok, mask=mask)                    # H:[B,L,D], attn_maps: list[LAYER][B,H,L,L]
+        attn_maps = 0
         B = X_sgB.size(0)
         H = H.view(B, self.T, self.S_PER_T, self.D)
         h_sg   = H[:,:,0,:]
@@ -492,7 +423,7 @@ class OneEncoder(nn.Module):
                 for kk in range(t+1):
                     mask[t*self.S_PER_T:(t+1)*self.S_PER_T, kk*self.S_PER_T:(kk+1)*self.S_PER_T] = 0.0
             
-            H, _ = self.encoder(Xtok, attn_mask=mask)  # [B,Lk,D]
+            H = self.encoder(Xtok, mask=mask)  # [B,Lk,D]
 
             # k 시점 출력 읽기 (prefix 기준 index)
             base = k * self.S_PER_T
@@ -562,7 +493,7 @@ criterion = MAPELoss()
 def to_device_batch(batch, device, non_blocking=True):
     return [x.to(device, non_blocking=non_blocking) for x in batch]
 
-EPOCHS = 300  # 데모
+EPOCHS = 1000  # 데모
 
 # === Checkpoint settings ===
 CKPT_DIR = "./checkpoints"
