@@ -8,6 +8,7 @@
 # - Inference: B=1 또는 B>1 모두 동일 경로
 # - IG & Attention 결과를 Plotly HTML로 저장 (인터랙티브)
 # - TensorBoard 로 학습 로그 기록
+# - Latency: Read/Write 2채널로 확장
 # =========================
 
 import numpy as np
@@ -43,14 +44,14 @@ if device.type == "cuda":
 # ---------------------
 # 1) Problem sizes
 # ---------------------
-T   = 8   # time steps per sequence
-M   = 6    # masters
-SG  = 4    # global stat dim
-SM  = 4    # master stat dim (0th = remaining BW)
-CG  = 4    # global cfg dim
-CGD = 4    # global delta cfg dim
-CM  = 4    # per-master cfg dim
-CMD = 4    # per-master delta cfg dim
+T   = 33   # time steps per sequence
+M   = 16    # masters
+SG  = 16    # global stat dim
+SM  = 16    # master stat dim (0th = remaining BW)
+CG  = 32    # global cfg dim
+CGD = 32    # global delta cfg dim
+CM  = 16    # per-master cfg dim
+CMD = 16    # per-master delta cfg dim
 REMAIN_IDX = 0
 
 D      = 128  # token dim (model width)
@@ -58,7 +59,7 @@ LAYERS = 2    # Transformer layers
 HEADS  = 8    # attention heads
 
 # ---------------------
-# 2) Synthetic label generator
+# 2) Synthetic label generator (Latency: 2채널 Read/Write)
 # ---------------------
 important_idx = torch.tensor([0, 1, 2, 3])
 important_w   = torch.tensor([2.0, -1.0, 2.0, -1.0])
@@ -66,26 +67,32 @@ important_w   = torch.tensor([2.0, -1.0, 2.0, -1.0])
 W_util_sg  = torch.zeros(SG, 1)
 W_util_sg[important_idx, 0] = important_w
 
-W_lat_sm   = torch.zeros(SM, 1)
-W_lat_sm[important_idx, 0] = important_w
+# (변경) read/write 각각의 가중치 2채널
+W_lat_sm   = torch.zeros(SM, 2)
+W_lat_sm[important_idx, 0] = important_w * 1.0   # read
+W_lat_sm[important_idx, 1] = important_w * 0.7   # write (임의 스케일)
 
 @torch.no_grad()
 def synth_labels(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd):
     """
     Return:
-      y_util[T,1], y_lat[T,M,1], y_next_sg[T,SG], y_next_sm[T,M,SM]
+      y_util[T,1], y_lat[T,M,2], y_next_sg[T,SG], y_next_sm[T,M,SM]
     """
     Tn = X_sg.shape[0]
     Mn = X_sm.shape[1]
     y_util = torch.zeros(Tn, 1)
-    y_lat  = torch.zeros(Tn, Mn, 1)
+    y_lat  = torch.zeros(Tn, Mn, 2)   # 2채널 (read/write)
     y_next_sg = torch.zeros(Tn, SG)
     y_next_sm = torch.zeros(Tn, Mn, SM)
     for t in range(Tn):
         # util: SG 특정 feature만 영향
         y_util[t] = torch.sigmoid(X_sg[t] @ W_util_sg)
-        # latency: SM 특정 feature만 영향(항상 양수 되도록 abs), scale up
-        y_lat[t] = torch.abs((X_sm[t] @ W_lat_sm) * 1000.0)
+
+        # latency: SM 특정 feature만 영향 (항상 양수 되도록 abs), 2채널
+        # X_sm[t]: [M, SM], W_lat_sm: [SM, 2] -> [M, 2]
+        lat_rw = X_sm[t] @ W_lat_sm
+        y_lat[t] = torch.abs(lat_rw * 1000.0)
+
         # next stat: t+1 입력을 정답으로 사용 (teacher forcing)
         if t < Tn-1:
             y_next_sg[t] = X_sg[t + 1]
@@ -303,7 +310,8 @@ class OneEncoder(nn.Module):
 
         # heads
         self.head_util    = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Sigmoid())
-        self.head_latency = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,1), nn.Softplus())
+        # (변경) latency head: [B,T,M,2] 출력
+        self.head_latency = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,2), nn.Softplus())
         self.head_next_sg = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,SG))
         self.head_next_sm = nn.Sequential(nn.LayerNorm(D), nn.Linear(D,96), nn.GELU(), nn.Linear(96,SM))
 
@@ -369,7 +377,7 @@ class OneEncoder(nn.Module):
         h_cmd  = H[:,:,3+2*self.M:3+3*self.M,:]
 
         util = self.head_util(h_sg)            # [B,T,1]
-        lat  = self.head_latency(h_sm)         # [B,T,M,1]
+        lat  = self.head_latency(h_sm)         # [B,T,M,2]
         nsg  = self.head_next_sg(h_cgd)        # [B,T,SG]
         nsm  = self.head_next_sm(h_cmd)        # [B,T,M,SM]
         return util, lat, nsg, nsm, attn_maps
@@ -402,8 +410,6 @@ class OneEncoder(nn.Module):
         idv = self.master_emb(ids).view(1, M, D)
 
         for k in range(Tn):
-            #X_sm[:, k, :, REMAIN_IDX] = R
-
             blocks = []
             for t in range(k+1):
                 pos_1d = self.time_emb.weight[t].view(1, D)
@@ -439,8 +445,8 @@ class OneEncoder(nn.Module):
             h_cgd = H[:, idx_cgd, :]
             h_cmd = H[:, idx_cmd0:idx_cmd0+M, :]
 
-            util_k = self.head_util(h_sg).squeeze(-1)
-            lat_k  = self.head_latency(h_sm).squeeze(-1)
+            util_k = self.head_util(h_sg).squeeze(-1)   # [B]
+            lat_k  = self.head_latency(h_sm)            # [B,M,2]
 
             utils.append(util_k)
             lats.append(lat_k)
@@ -449,13 +455,11 @@ class OneEncoder(nn.Module):
             if k < Tn - 1:
                 X_sg[:, k+1] = self.head_next_sg(h_cgd)
                 next_sm = self.head_next_sm(h_cmd)
-                #next_sm[:,:,REMAIN_IDX] = torch.clamp(next_sm[:,:,REMAIN_IDX], 0.0, 1.0)
                 X_sm[:, k+1] = next_sm
-                R = next_sm[:,:,REMAIN_IDX]
 
-        utils = torch.stack(utils, dim=1)
-        lats  = torch.stack(lats,  dim=1)
-        R_hist= torch.stack(R_hist, dim=1)
+        utils = torch.stack(utils, dim=1)   # [B,T]
+        lats  = torch.stack(lats,  dim=1)   # [B,T,M,2]
+        R_hist= torch.stack(R_hist, dim=1)  # [B,T,M]
         return utils, lats, R_hist, attend_map
 
 # ---------------------
@@ -554,8 +558,8 @@ else:
             X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB, y_utilB, y_latB, y_nsgB, y_nsmB = to_device_batch(batch, device)
             util, lat, nsg, nsm, _ = model.analysis_batch(X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB)
 
-            l_util = criterion(util, y_utilB)
-            l_lat  = criterion(lat,  y_latB)
+            l_util = criterion(util, y_utilB)  # [B,T,1]
+            l_lat  = criterion(lat,  y_latB)   # [B,T,M,2]
             l_nsg  = F.mse_loss(nsg[:,:-1], y_nsgB[:,:-1])
             l_nsm  = F.mse_loss(nsm[:,:-1], y_nsmB[:,:-1])
 
@@ -628,7 +632,7 @@ except Exception as e:
     print("[TensorBoard] add_hparams failed:", e)
 
 # ============================================================
-# 7) IG (Integrated Gradients) : 통합 축(모든 설정/스탯)
+# 7) IG (Integrated Gradients)
 # ============================================================
 def build_feature_axis_labels(SG, CG, CGD, M, SM, CM, CMD):
     labels = []
@@ -721,8 +725,10 @@ def ig_util_combined_matrix(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
     mat_all = torch.cat(mats, dim=0)  # [T, Dtot]
     return mat_all
 
-def ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
-                                             steps=48, baseline_mode="zero", signed=True):
+def ig_latency_combined_matrices_all_masters(
+    model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
+    steps=48, baseline_mode="zero", signed=True, ch: int = 0  # ch=0(read), 1(write)
+):
     model.eval()
     M = X_smB.size(2)
     mats_per_m = []
@@ -733,11 +739,14 @@ def ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB,
             inputs = [X_sgB.clone().detach(), X_smB.clone().detach(),
                       X_cgB.clone().detach(), X_cgdB.clone().detach(),
                       X_cmB.clone().detach(), X_cmdB.clone().detach()]
-            def forward_fn(x_list, tt=t, mm=m):
+            def forward_fn(x_list, tt=t, mm=m, cc=ch):
                 X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd = x_list
                 _, lat, _, _, _ = model.analysis_batch(X_sg, X_sm, X_cg, X_cgd, X_cm, X_cmd)
-                return lat[0, tt, mm, 0]
-            A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd = _integrated_gradients(model, inputs, lambda z: forward_fn(z, t, m), steps=steps, baseline_mode=baseline_mode)
+                return lat[0, tt, mm, cc]   # 채널 선택
+            A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd = _integrated_gradients(
+                model, inputs, lambda z: forward_fn(z, t, m, ch),
+                steps=steps, baseline_mode=baseline_mode
+            )
             mat_t = concat_attrs_timewise(A_sg, A_sm, A_cg, A_cgd, A_cm, A_cmd, signed=signed)
             mats.append(mat_t[t].unsqueeze(0))
         mats_per_m.append(torch.cat(mats, dim=0))  # [T, Dtot]
@@ -1000,16 +1009,18 @@ with torch.no_grad():
         X_sg.unsqueeze(0), X_sm.unsqueeze(0), X_cg.unsqueeze(0), X_cgd.unsqueeze(0),
         X_cm.unsqueeze(0), X_cmd.unsqueeze(0)
     )
-    utilR, latR, nsgR, attn_maps = model.rollout_batch(
+    utilR, latR, R_hist, attn_maps_roll = model.rollout_batch(
         X_sg.unsqueeze(0), X_sm.unsqueeze(0), X_cg.unsqueeze(0), X_cgd.unsqueeze(0),
         X_cm.unsqueeze(0), X_cmd.unsqueeze(0)
     )
+
 print("\n=== Quick Analysis (B=1) ===")
 for time in range(T):
-    print("Util: ", time, "%.3f, %.3f, %.3f"%(utilB[:, time], y_util[time], utilR[:, time]) )
-    print("GlobalStat: ", time, nsgB[:,time, :])
-    print("LabelStat: ", time, y_next_sg[time,:])
-    
+    print(f"t={time} | Util  pred(B)={float(utilB[0,time,0]):.3f}  label={float(y_util[time,0]):.3f}  pred(R)={float(utilR[0,time]):.3f}")
+    # 필요시 글로벌 스탯/라벨 확인
+    # print("GlobalStat(pred next):", nsgB[0, time])
+    # print("GlobalStat(label next):", y_next_sg[time])
+
 X_sgB  = X_sg.unsqueeze(0)
 X_smB  = X_sm.unsqueeze(0)
 X_cgB  = X_cg.unsqueeze(0)
@@ -1018,29 +1029,43 @@ X_cmB  = X_cm.unsqueeze(0)
 X_cmdB = X_cmd.unsqueeze(0)
 labels_all = build_feature_axis_labels(SG, CG, CGD, M, SM, CM, CMD)
 
+# Util IG
 util_mat = ig_util_combined_matrix(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
                                    steps=64, baseline_mode="zero", signed=True)
-lat_mats = ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
-                                                    steps=48, baseline_mode="zero", signed=True)
 
+# Latency IG (read/write 분리)
+lat_mats_read  = ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
+                                                         steps=48, baseline_mode="zero", signed=True, ch=0)
+lat_mats_write = ig_latency_combined_matrices_all_masters(model, X_sgB, X_smB, X_cgB, X_cgdB, X_cmB, X_cmdB,
+                                                         steps=48, baseline_mode="zero", signed=True, ch=1)
+
+# HTML 저장
 write_interactive_ig_heatmap(util_mat, labels_all,
                              html_path="util_ig_interactive.html",
                              title="IG - Utili (+g / −r)",
                              pos_green=True)
 
-write_interactive_latency_grid(lat_mats, labels_all, cols=3,
-                               html_path="latency_ig_grid.html",
-                               title_prefix="IG - Lat (+r / −g)")
+write_interactive_latency_grid(lat_mats_read,  labels_all, cols=3,
+                               html_path="latency_read_ig_grid.html",
+                               title_prefix="IG - Lat(Read) (+r / −g)")
 
+write_interactive_latency_grid(lat_mats_write, labels_all, cols=3,
+                               html_path="latency_write_ig_grid.html",
+                               title_prefix="IG - Lat(Write) (+r / −g)")
+
+# 텍스트 요약
 print_top_bottom_over_time(util_mat, labels_all, k=5, tag="Util")
-print_top_bottom_latency_all_masters(lat_mats, labels_all, k=5)
+print_top_bottom_latency_all_masters(lat_mats_read,  labels_all, k=5)
+print_top_bottom_latency_all_masters(lat_mats_write, labels_all, k=5)
 
+# Attention 시각화 (analysis에서의 attn_maps 사용)
 tok_labels = build_token_labels(T, M)
 write_interactive_attention(attn_maps, tok_labels, html_path="attn_interactive.html")
 
 print("\nDone. Check HTML files:")
 print("- util_ig_interactive.html")
-print("- latency_ig_grid.html")
+print("- latency_read_ig_grid.html")
+print("- latency_write_ig_grid.html")
 print("- attn_interactive.html")
 
 # ===== TensorBoard: 종료 =====
